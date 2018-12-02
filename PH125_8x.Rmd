@@ -1,0 +1,476 @@
+---
+title: "PH 125.8x Machine Learning"
+author: "G Smith"
+date: "November 16, 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+# Loading my standard work environment libraries and the ISLR library
+library(MASS) # LDA package
+library(class) # K-Nearest Neighbors package
+library(glmnet) # Generalized Linear Models - LASSO and Ridge Regression
+library(leaps) # best subset, FSS and BSS regression
+library(broom)
+library(gridExtra)
+library(GGally)
+library(knitr)
+library(ISLR)
+library(boot) # bootstrap and CV
+library(car)
+library(caret)
+library(e1071)
+library(lubridate)
+library(tidyverse)
+library(dslabs)
+# note that dplyr select() is masked by MASS library. Need to use dplyr::select()
+# my own functions for calculating classification error and overall accuracy
+calc_class_err <- function(actual, predicted) {
+  mean(actual != predicted)
+}
+calc_class_acc <- function(actual, predicted){
+  mean(actual == predicted)
+}
+```
+## Chapter 56 The confusion matrix, prevalence, sensitivity and specificity
+```{r}
+heights <-  as.tibble(heights)
+heights
+```
+```{r}
+# creating test set
+set.seed(2)
+test_index <- createDataPartition(heights$sex, times = 1, p = 0.5, list = FALSE)
+test_set <- heights[test_index,]
+train_set <- heights[-test_index,]
+```
+### 56.2 Overall Accuracy
+```{r}
+# first example is guessing the outcome by generating a prediction w/o considering height
+y_hat <- sample(c("Male","Female"), length(test_index), replace = TRUE) %>% 
+         factor(levels = levels(test_set$sex))
+# checking accuracy
+calc_class_acc(y_hat, test_set$sex)
+```
+```{r}
+# looking at heigths by sex
+heights %>% 
+  group_by(sex) %>% 
+  summarise(mean(height), sd(height))
+```
+```{r}
+# now using height as a predictor in a simple example
+male_ht <- 69.31475 - 2 * 3.611024
+y_hat <- if_else(test_set$height > male_ht, "Male", "Female") %>% 
+         factor(levels = levels(test_set$sex))
+calc_class_acc(y_hat, test_set$sex)
+```
+```{r}
+# now searching for a male height cutoff value
+cutoff <- seq(61, 70) #generating a sequence of cutoff values
+accuracy <- map_dbl(cutoff, function(x){
+  y_hat <- if_else(train_set$height > x, "Male", "Female") %>% 
+            factor(levels = levels(train_set$sex))
+            calc_class_acc(y_hat, train_set$sex)
+})
+```
+```{r}
+plot(cutoff,accuracy)
+```
+```{r}
+max(accuracy)
+```
+```{r}
+best_cutoff <- cutoff[which.max(accuracy)]
+best_cutoff
+```
+```{r}
+# now using the best_cutoff on the test set
+y_hat <- if_else(test_set$height > best_cutoff, "Male", "Female") %>% 
+          factor(levels = levels(test_set$sex))
+calc_class_acc(y_hat, test_set$sex)
+```
+
+### 56.3 The confusion matrix
+```{r}
+# building a table of predicted vs actual
+tab <- table(predicted = y_hat, actual = test_set$sex)
+tab
+```
+note that prediction accuracy is much higher for males than for females; see below
+```{r}
+test_set %>% 
+  mutate(y_hat = y_hat) %>%    # this creates a temporary variable in the data set
+  group_by(sex) %>% 
+  summarise(accuracy = calc_class_acc(y_hat, sex))
+```
+
+### 56.4 Sensitivity and Specificity
+```{r}
+# using confusionMatrix
+confusionMatrix(data = y_hat, reference = test_set$sex, positive = "Female")
+```
+```{r}
+confusionMatrix(tab, positive = "Female") # this is an alternative way of calling confusionMatrix
+```
+Overall accuracy is ~82%, but Sensitivity (correctly predicting Female) is low ~42% where as Specificity (correctly predicting Male) is high ~93%. Note that this due to females only making up ~23% of the data set.
+
+### 56.5 Balanced Accuracy and F1 Score
+```{r}
+# using the F1 score (balanced accuracy) to select the best cutoff point rather than overall accuracy 
+cutoff <- seq(61,70)
+F_1 <- map_dbl(cutoff, function(x){
+  y_hat <- if_else(train_set$height > x, "Male", "Female") %>% 
+    factor(levels = levels(train_set$sex))
+  F_meas(data = y_hat, reference = factor(train_set$sex))
+})
+```
+```{r}
+plot(cutoff, F_1)
+```
+```{r}
+max(F_1)
+```
+```{r}
+best_cutoff <- cutoff[which.max(F_1)]
+best_cutoff
+```
+```{r}
+# using the F_1 best cutoff on the test set
+y_hat <- if_else(test_set$height > best_cutoff, "Male", "Female") %>% 
+          factor(levels = levels(test_set$sex))
+confusionMatrix(data = y_hat, reference = test_set$sex, positive = "Female")
+```
+note that overall accuracy has decreased, but sensitivity has improved to ~68%. Balance accuracy has also improved to ~76%
+
+### 56.7 ROC and Precision-Recall Curves
+
+```{r}
+# guessing "Male" 90% of the time = higher accuracy BUT lower Specificity due to bias (more Males that Females) in the data set
+
+p <- 0.9
+y_hat <- sample(c("Male","Female"), length(test_index), replace = TRUE, prob = c(p, 1-p)) %>% 
+          factor(levels = levels(test_set$sex))
+calc_class_acc(y_hat,test_set$sex)
+```
+
+#### ROC Curve - Sensitivity (TPR) vs 1 - Specificity = (FPR)
+```{r}
+# guessing Male or Female w/ different p's and plotting the ROC Curve
+probs <- seq(0,1, length.out = 10)
+guessing <- map_df(probs, function(p) {
+  y_hat <- sample(c("Male", "Female"), length(test_index), replace = TRUE, prob = c(p, 1-p)) %>% 
+           factor(levels = c("Female", "Male")) 
+  list(method = "Guessing",
+       FPR = 1 - specificity(y_hat, test_set$sex),
+       TPR = sensitivity(y_hat, test_set$sex))
+})
+guessing %>% 
+  qplot(FPR, TPR, data = .,xlab ="1 - Specificity = (FPR)", ylab = "Sensitivity (TPR")
+```
+```{r}
+# using height to predict sex and plotting the ROC Curves of Guessing vs Height as a predictor
+cutoffs <- c(50,seq(60,75),80)
+height_cutoff <- map_df(cutoffs, function(x){
+  y_hat <- if_else(test_set$height > x, "Male", "Female") %>% 
+    factor(levels = levels(test_set$sex))
+  list(method = "Height Cutoff",
+       FPR = 1 - specificity(y_hat, test_set$sex),
+       TPR = sensitivity(y_hat, test_set$sex))
+})
+
+bind_rows(guessing, height_cutoff) %>% 
+  ggplot(aes(FPR, TPR, color = method)) +
+  geom_line() +
+  geom_point() + 
+  xlab("1 - Specificity = (FPR)") +
+  ylab("Sensitivity (TPR)")
+
+```
+Using height as a predictor has a better ROC curve at all levels of FPR than guessing. 
+
+#### Precision (PPV) - Recall (Sensitivity) Curves
+Precision = TP/(TP+FP) = Pr(Y = 1|Y_hat = 1)
+Recall = Sensitivity = TP/(TP+FN) = Pr(Y_hat = 1|Y=1)
+Use Precision Recall Curves when Prevalance may matter, i.e. when prevalance is very high (close to 1) or very low (close to 0)
+or when the data set may be biased (in the height data set the prevalance of females is much lower than males)
+
+```{r}
+# building Precision Recall Curves for guessing vs height as a predictor
+guessing <- map_df(probs, function(p) {
+  y_hat <- sample(c("Male", "Female"), length(test_index), replace = TRUE, prob = c(p, 1-p)) %>% 
+           factor(levels = c("Female", "Male")) 
+  list(method = "Guessing",
+       recall = sensitivity(y_hat, test_set$sex),
+       precision = precision(y_hat, test_set$sex))
+})
+height_cutoff <- map_df(cutoffs, function(x){
+  y_hat <- if_else(test_set$height > x, "Male", "Female") %>% 
+    factor(levels = levels(test_set$sex))
+  list(method = "Height Cutoff",
+       recall = sensitivity(y_hat, test_set$sex),
+       precision = precision(y_hat, test_set$sex),
+       height_cutoff = x)
+})
+bind_rows(guessing, height_cutoff) %>% 
+  ggplot(aes(recall, precision, color = method)) +
+  geom_line() +
+  geom_point() + 
+  xlab("Recall (Sensitivity)") +
+  ylab("Precision")
+```
+```{r}
+height_cutoff
+```
+### 56 - Exercises
+```{r}
+library(lubridate)
+data("reported_heights")
+reported_heights
+```
+```{r}
+dat <- mutate(reported_heights, date_time = ymd_hms(time_stamp)) %>% 
+  filter(date_time >= make_date(2016, 01, 25) &
+          date_time < make_date(2016, 02, 1)) %>% 
+  mutate(type = if_else(day(date_time) == 25 & hour(date_time) == 8 & between(minute(date_time), 15, 30), "inclass", "online")) %>% 
+  select(sex, type)
+dat$sex <- as.factor(dat$sex)
+dat$type <- as.factor(dat$type)
+dat
+```
+```{r}
+  dat %>% 
+  group_by(type) %>% 
+  summarise(mean(sex == "Female"))
+```
+```{r}
+# guessing "Female" based on their prevalance in the overall data set
+p <- mean(dat$sex == "Female")
+y_hat <- sample(c("Female","Male"), nrow(dat), replace = TRUE, prob = c(p, 1-p)) %>% 
+          factor(levels = levels(dat$sex))
+confusionMatrix(data = y_hat, reference = dat$sex, positive = "Female")
+```
+
+```{r}
+# using "inclass" vs "online" to predict sex
+y_hat <- if_else(dat$type == "inclass", "Female", "Male") %>% 
+          factor(levels = levels(dat$sex))
+confusionMatrix(data = y_hat, reference = dat$sex, positive = "Female")
+```
+```{r}
+sensitivity(y_hat, dat$sex)
+```
+```{r}
+specificity(y_hat, dat$sex)
+```
+```{r}
+table(predicted = y_hat, actual = dat$sex)
+```
+### Comprehension Check: Basics of Evaluating Machine Learning - Online Course
+```{r}
+# dropping "setosa" from the data set
+data(iris)
+iris <- iris[-which(iris$Species=='setosa'),]
+y <- iris$Species
+y
+```
+#### Q1
+```{r}
+#Q1 - splitting the data into test and train 50/50
+set.seed(2)
+test_index <- createDataPartition(y, times = 1, p = 0.5, list = FALSE)
+test <- as.tibble(iris[test_index,])
+train <- as.tibble(iris[-test_index,])
+train
+train %>% 
+  group_by(Species) %>% 
+  summarise(sl_mean = mean(Sepal.Length), sw_mean = mean(Sepal.Width), pl_mean = mean(Petal.Length), pw_mean = mean(Petal.Width))
+
+```
+#### Q2
+```{r}
+# now searching for a Sepal.Length cutoff value1
+sl.cutoff <- seq(min(train$Sepal.Length), max(train$Sepal.Length), by = 0.01) #generating a sequence of cutoff values
+sl.accuracy <- map_dbl(sl.cutoff, function(x){
+  y_hat <- if_else(train$Sepal.Length > x, "virginica", "versicolor") %>% 
+            factor(levels = levels(train$Species))
+            calc_class_acc(y_hat, train$Species)
+})
+```
+```{r}
+plot(sl.cutoff,sl.accuracy)
+```
+```{r}
+max(sl.accuracy)
+```
+
+```{r}
+# now searching for a Sepal.Width cutoff value
+sw.cutoff <- seq(min(train$Sepal.Width), max(train$Sepal.Width), by = 0.01) #generating a sequence of cutoff values
+sw.accuracy <- map_dbl(sw.cutoff, function(x){
+  y_hat <- if_else(train$Sepal.Width > x, "virginica", "versicolor") %>% 
+            factor(levels = levels(train$Species))
+            calc_class_acc(y_hat, train$Species)
+})
+```
+```{r}
+plot(sw.cutoff,sw.accuracy)
+```
+```{r}
+max(sw.accuracy)
+```
+```{r}
+# now searching for a Petal.Length cutoff value
+pl.cutoff <- seq(min(train$Petal.Length), max(train$Petal.Length), by = 0.01) #generating a sequence of cutoff values
+pl.accuracy <- map_dbl(pl.cutoff, function(x){
+  y_hat <- if_else(train$Petal.Length > x, "virginica", "versicolor") %>% 
+            factor(levels = levels(train$Species))
+            calc_class_acc(y_hat, train$Species)
+})
+```
+```{r}
+plot(pl.cutoff,pl.accuracy)
+```
+```{r}
+max(pl.accuracy)
+```
+```{r}
+# now searching for a Petal.Width cutoff value
+pw.cutoff <- seq(min(train$Petal.Width), max(train$Petal.Width), by = 0.01) #generating a sequence of cutoff values
+pw.accuracy <- map_dbl(pw.cutoff, function(x){
+  y_hat <- if_else(train$Petal.Width > x, "virginica", "versicolor") %>% 
+            factor(levels = levels(train$Species))
+            calc_class_acc(y_hat, train$Species)
+})
+plot(pw.cutoff,pw.accuracy)
+```
+
+```{r}
+max(pw.accuracy)
+```
+#### Q3 - 
+```{r}
+best_cutoff <- pl.cutoff[which.max(pl.accuracy)]
+best_cutoff
+# now using the best_cutoff on the test set
+y_hat <- if_else(test$Petal.Length > best_cutoff, "virginica", "versicolor") %>% 
+            factor(levels = levels(test$Species))
+confusionMatrix(data = y_hat, reference = test$Species, positive = "virginica")
+```
+#### Q4
+
+```{r}
+# now running on test data set
+sl.accuracy <- map_dbl(sl.cutoff, function(x){
+  y_hat <- if_else(test$Sepal.Length > x, "virginica", "versicolor") %>% 
+            factor(levels = levels(test$Species))
+            calc_class_acc(y_hat, test$Species)
+})
+max(sl.accuracy)
+```
+```{r}
+sw.accuracy <- map_dbl(sw.cutoff, function(x){
+  y_hat <- if_else(test$Sepal.Width > x, "virginica", "versicolor") %>% 
+            factor(levels = levels(test$Species))
+            calc_class_acc(y_hat, test$Species)
+})
+max(sw.accuracy)
+```
+```{r}
+pl.accuracy <- map_dbl(pl.cutoff, function(x){
+  y_hat <- if_else(test$Petal.Length > x, "virginica", "versicolor") %>% 
+            factor(levels = levels(test$Species))
+            calc_class_acc(y_hat, test$Species)
+})   
+max(pl.accuracy)
+```
+
+```{r}
+pw.accuracy <- map_dbl(pw.cutoff, function(x){
+  y_hat <- if_else(test$Petal.Width > x, "virginica", "versicolor") %>% 
+            factor(levels = levels(test$Species))
+            calc_class_acc(y_hat, test$Species)
+})
+max(pw.accuracy)
+```
+
+#### Q5
+```{r}
+# redoing training set to find best cutoff for Petal.Length and Petal.Width
+pl.accuracy <- map_dbl(pl.cutoff, function(x){
+  y_hat <- if_else(train$Petal.Length > x, "virginica", "versicolor") %>% 
+            factor(levels = levels(train$Species))
+            calc_class_acc(y_hat, train$Species)
+})   
+best_cutoff_pl <- pl.cutoff[which.max(pl.accuracy)]
+
+pw.accuracy <- map_dbl(pw.cutoff, function(x){
+  y_hat <- if_else(train$Petal.Width > x, "virginica", "versicolor") %>% 
+            factor(levels = levels(train$Species))
+            calc_class_acc(y_hat, train$Species)
+})
+best_cutoff_pw <-  pw.cutoff[which.max(pw.accuracy)]
+# now using best PL cutoff and PW cutoff on test set
+y_hat <- if_else(test$Petal.Length > best_cutoff_pl & test$Petal.Width > best_cutoff_pw, "virginica", "versicolor") %>% 
+            factor(levels = levels(test$Species))
+calc_class_acc(y_hat, test$Species)
+```
+### Comprehension Check - Conditional Probabilities 
+#### Q1
+```{r}
+# using Bayes Theorem
+# P(A|B) = P(B|A)*P(A)/P(B) = P(B|A)*P(A)/[P(B|A)*P(A) + P(B|A-)*P(A-)]
+# find the P(D+|T+)
+# Where P(T+|D+) = 0.85, P(T-|D-) = 0.9, P(D+) = 0.02 ==> P(T+|D-) = 1-P(T-|D-) = 0.1 and P(D-) = 1-P(D+) = 0.98
+prob_d_given_pos_test <- (.85*0.02)/((.85*0.02) + (.1*.98))
+prob_d_given_pos_test
+```
+#### Q 2 - Q4
+```{r}
+# using a simulation w/ a population of 1M
+set.seed(1)
+disease <- sample(c(0,1), size=1e6, replace=TRUE, prob=c(0.98,0.02)) # simulation w/ a population of 1M w/ disease prevalance = 0.02
+test <- rep(NA, 1e6) # building a test vector of 1M
+test[disease==0] <- sample(c(0,1), size=sum(disease==0), replace=TRUE, prob=c(0.90,0.10)) # test is neg given that disease is negative 90% of the time
+test[disease==1] <- sample(c(0,1), size=sum(disease==1), replace=TRUE, prob=c(0.15, 0.85)) # test is pos given that disease is pos 85% of the time
+```
+
+```{r}
+# Q2
+test_pos <- mean(test)
+test_pos
+```
+```{r}
+prob_dis_pos <- mean(disease)
+prob_dis_pos
+```
+```{r}
+pro_dis_neg <- 1 - prob_dis_pos
+pro_dis_neg
+```
+```{r}
+# Q3 probability disease  given test is negative
+sum(disease[test == 0])/length(disease[test == 0])
+```
+```{r}
+# Q4 probability disease given test is positive P(D+|T+)
+sum(disease[test == 1])/length(disease[test == 1])
+```
+
+```{r}
+#Q5 - relative risk given a positive test = P(D+|T+)/P(D)
+(sum(disease[test == 1])/length(disease[test == 1]))/0.02
+# see result below: in this case, if the test is positive you're more than 7x more likely to have the disease
+```
+#
+
